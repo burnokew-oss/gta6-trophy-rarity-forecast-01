@@ -1,364 +1,402 @@
-#!/usr/bin/env python3
-"""Forecast GTA VI trophy earn rates (Exophase) at a case's target.
+"""Forecaster for GTA VI trophy earn rates on Exophase.
 
-Refresh-step holders/players forecaster, Python 3.13 standard library
-only, deterministic, no network.
+Reads one case (a checkpoint, a horizon, the trophy list and every page
+read the house kept before the checkpoint) and writes five quantiles of
+each trophy's earn rate at the target.  The page only changes when
+Exophase refreshes it, so the model works with holders and players
+rather than with raw rates: a refresh brings a step of new players whose
+own earn pattern dilutes every rate, and between refreshes the holders
+of a trophy keep creeping up as tracked players play on.
 
-Idea (see README.md): Exophase does not update continuously. The page
-sits frozen for hours, then refreshes in one step: the tracked-player
-count jumps and most earn rates fall, because the newly tracked players
-have earned far fewer trophies than the players tracked so far. So this
-program works in holders space, not in raw rates.
-
-  1. Collapse the history to its distinct reads (consecutive identical
-     reads are one refresh point); between distinct reads nothing changed.
-  2. From the distinct reads estimate the refresh gap G (hours between
-     distinct reads), the tracked-player multiplier M per refresh, and
-     each trophy's cohort earn rate a_i: the share of the players who
-     arrive at a refresh (and of the holders revealed by it) who hold
-     trophy i, i.e. new holders per new tracked player at a refresh.
-     a_i is estimated per interval as delta-holders / delta-players,
-     pooled with recency weights (the most recent interval weighs 1,
-     older ones decay by 0.85 per interval).
-  3. Shrink a_i toward the median a of the trophy's own tier
-     (platinum/gold/silver/bronze). The shrinkage weight grows with
-     how many new players the history has actually seen, so a trophy
-     with a noisy or short history borrows its tier-mates' behaviour.
-     A trophy at 100% in every read is held by every tracked player,
-     so its holders track the player count exactly (a_i = 1) and it is
-     exempt from shrinkage.
-  4. The future is a renewal process: the next refresh is due G - S
-     hours after the checkpoint, where S is how stale the current page
-     already is, then one refresh every G hours (gap lognormal, median
-     the due gap / G, sigma 0.4). For a scenario, the player count
-     compounds by M per refresh (multiplier decaying 0.9x per future
-     refresh, since a launch influx fades) while holders grow by
-     a_i per new tracked player; the rate is holders / players. The
-     rate therefore asymptotes to what the incoming cohort actually
-     earns -- a natural ceiling that damps extrapolation -- and holders
-     are capped at the player count, so no rate can exceed 100%.
-  5. The five quantiles are the quantiles of that refresh-count
-     mixture over deterministic scenarios, widened in logit space by
-     a fixed extra spread (SIGMA_EXTRA = 0.30) for parameter
-     uncertainty.
-
-Flat-history priors: when the history is completely flat (no refresh
-ever observed, as on launch night) the data-driven estimates do not
-exist and stated priors take over: gap 5 h, player multiplier 5x per
-refresh, new players holding about one trophy each, spread over
-trophies in proportion to (rate)^2 -- which puts almost all of a new
-player's trophies on the near-universal trophy and almost none on the
-rare ones. Staleness S then counts the observed flat window plus 1 h
-for the staleness already present at the first probe. These priors are
-the only place the launch-night shape is assumed; once the history
-shows real refreshes they wash out.
-
-Usage: reads every *.in file in $MAKEFUN_INPUT_DIR (else /input) and
-writes /output/<id>.out for each (else $MAKEFUN_OUTPUT_DIR).
+Two regimes share the same output shaping.  A history with at most one
+distinct read has never shown a refresh, so a tuned launch-night prior
+drives a Monte Carlo over refresh times and player multipliers.  A
+history with several distinct reads identifies, per trophy, how new
+holders arrive through two channels (with the incoming players, and
+from tracked players who do not hold the trophy yet), shrinks those
+rates toward their tier, fits a decaying player-growth curve, and
+simulates the horizon in six-hour steps.  Python 3.13, standard
+library only, no network, fully deterministic.
 """
 
-import json
 import math
-import os
 import random
-import statistics
-import sys
 from datetime import datetime, timezone
 
-# Fixed extra spread in logit space, chosen on the backtest in README.md.
-SIGMA_EXTRA = 0.30
-# Lognormal sigma for refresh gaps.
-GAP_SIGMA = 0.4
-# Decay of the player multiplier per future refresh.
-MULT_DECAY = 0.9
-# Flat-history priors (see module docstring).
-FLAT_GAP_HOURS = 5.0
-FLAT_MULTIPLIER = 5.0
-# Number of deterministic scenarios for the refresh-count mixture.
-N_SCENARIOS = 1000
-# Fixed seed: two runs on the same case write byte-identical output.
-SEED = 20261119
-
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.6448536269514722, -0.6744897501960817, 0.0,
-     0.6744897501960817, 1.6448536269514722]
+TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
+ZS = (-1.6448536269514722, -0.6744897501960817, 0.0,
+      0.6744897501960817, 1.6448536269514722)
+PIN_ROW = [99.97, 99.99, 99.99, 99.99, 99.99]
+SEED = 20261121
+KNOWN_TIERS = ("platinum", "gold", "silver", "bronze")
 
 
-def parse_time(text):
-    """Parse an ISO 8601 UTC timestamp into an aware datetime."""
-    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+def clamp(x, lo, hi):
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
 
 
-def logit(pct):
-    p = min(max(pct / 100.0, 0.0001), 0.9999)
-    return math.log(p / (1.0 - p))
+def logit_pct(pct):
+    """Log-odds of a percentage, the percentage clamped first."""
+    p = clamp(pct, 0.01, 99.99)
+    return math.log(p / (100.0 - p))
 
 
 def inv_logit(x):
-    if x >= 0:
+    """Inverse log-odds back to a percentage, overflow-safe."""
+    if x >= 0.0:
         return 100.0 / (1.0 + math.exp(-x))
     e = math.exp(x)
     return 100.0 * e / (1.0 + e)
 
 
-def clamp_pct(x):
-    return min(max(x, 0.0), 100.0)
+def sample_quantile(sorted_vals, tau):
+    """Linear-interpolated quantile of an already sorted sample."""
+    n = len(sorted_vals)
+    if n == 1:
+        return sorted_vals[0]
+    pos = tau * (n - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
 
 
-def holders_of(rates, players):
-    """Holders per trophy implied by rates (percent) and player count."""
+def five_quantiles(values):
+    ordered = sorted(values)
+    return [sample_quantile(ordered, t) for t in TAUS]
+
+
+def widen(quantiles, sigma):
+    """Spread five quantiles in logit space, then force monotone."""
     out = []
-    for r in rates:
-        if r is None:
-            out.append(None)
-        else:
-            out.append(r * players / 100.0)
+    for q, z in zip(quantiles, ZS):
+        v = inv_logit(logit_pct(q) + z * sigma)
+        v = clamp(round(v, 4), 0.0, 100.0)
+        if out and v < out[-1]:
+            v = out[-1]
+        out.append(v)
     return out
 
 
-def distinct_reads(history):
-    """Collapse consecutive identical reads to one refresh point each.
+def median_of(values):
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
 
-    Returns a list of dicts with slot time, players and rates, keeping
-    the first occurrence of each distinct page.
+
+def parse_time(text):
+    s = str(text).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def holders_of(rate_pct, players):
+    return rate_pct * players / 100.0
+
+
+def distinct_reads(case):
+    """Collapse a case history to its distinct reads, gaps filled.
+
+    A read that repeats the previously kept read exactly (same player
+    count, same raw rate list) is the same page seen again and drops
+    out.  A missing or null rate inherits the trophy's last seen rate,
+    or 0.0 when the trophy has never shown one.  An empty history
+    becomes a single synthetic read at the checkpoint.
     """
-    distinct = []
+    n = len(case["trophies"])
+    history = case.get("history") or []
+    kept = []
     prev_key = None
     for read in history:
-        key = (read.get("players_tracked"),
-               tuple(read.get("rates") or []))
-        if key == prev_key:
+        raw_rates = read.get("rates") or []
+        key = (read.get("players_tracked"), tuple(raw_rates))
+        if kept and key == prev_key:
             continue
+        kept.append(read)
         prev_key = key
-        distinct.append({
-            "slot": parse_time(read["slot"]),
-            "players": read.get("players_tracked"),
-            "rates": list(read.get("rates") or []),
+    if not kept:
+        return [{"when": parse_time(case["at"]), "players": 1.0,
+                 "rates": [0.0] * n}]
+    last_seen = [None] * n
+    reads = []
+    for read in kept:
+        raw_rates = read.get("rates") or []
+        filled = []
+        for i in range(n):
+            v = raw_rates[i] if i < len(raw_rates) else None
+            if v is None:
+                filled.append(last_seen[i] if last_seen[i] is not None
+                              else 0.0)
+            else:
+                fv = float(v)
+                filled.append(fv)
+                last_seen[i] = fv
+        players = read.get("players_tracked")
+        reads.append({
+            "when": parse_time(read["slot"]),
+            "players": float(players) if players is not None else 0.0,
+            "rates": filled,
         })
-    return distinct
+    return reads
 
 
-def fill_rates(distinct, n_trophies):
-    """Fill null rates in distinct reads from the previous distinct read."""
-    last = [None] * n_trophies
-    for d in distinct:
-        rates = d["rates"]
-        for i in range(n_trophies):
-            if i >= len(rates):
-                rates.append(None)
-            if rates[i] is None:
-                rates[i] = last[i] if last[i] is not None else 0.0
-            last[i] = rates[i]
-        d["rates"] = rates[:n_trophies]
-    return distinct
-
-
-def estimate_from_history(distinct, trophies):
-    """Estimate gap, multiplier and per-trophy cohort rates.
-
-    Returns (gap_hours, multiplier, cohort_rates, staleness_hours,
-    is_flat, first_slot).
-    """
-    n = len(trophies)
-    last = distinct[-1]
-    n_last = float(last["players"])
-    last_rates = last["rates"]
-
-    if len(distinct) <= 1:
-        # Flat history: stated priors only.
-        total_sq = sum(r * r for r in last_rates) or 1.0
-        cohort = [(r * r) / total_sq for r in last_rates]
-        # The near-universal trophy: almost every new player holds it.
-        return (FLAT_GAP_HOURS, FLAT_MULTIPLIER, cohort, True)
-
-    # Refresh gap: median hours between distinct reads.
-    gaps = []
-    for a, b in zip(distinct, distinct[1:]):
-        gaps.append((b["slot"] - a["slot"]).total_seconds() / 3600.0)
-    gap = statistics.median(gaps) if gaps else FLAT_GAP_HOURS
-    gap = min(max(gap, 0.5), 48.0)
-
-    # Player multiplier per refresh: median of successive ratios.
-    ratios = []
-    for a, b in zip(distinct, distinct[1:]):
-        if a["players"] and b["players"]:
-            ratios.append(float(b["players"]) / float(a["players"]))
-    mult = statistics.median(ratios) if ratios else 1.0
-    mult = min(max(mult, 1.0), 20.0)
-
-    # Per-interval cohort rates, pooled with recency weights.
-    n_intervals = len(distinct) - 1
-    holders = [holders_of(d["rates"], d["players"]) for d in distinct]
-    weights = []
-    delta_n_total = 0.0
-    for j in range(n_intervals):
-        w = 0.85 ** (n_intervals - 1 - j)
-        dn = float(distinct[j + 1]["players"]) - float(distinct[j]["players"])
-        if dn > 0:
-            weights.append((j, w, dn))
-            delta_n_total += w * dn
-        else:
-            weights.append((j, w, 0.0))
-    raw = []
-    for i in range(n):
-        num = 0.0
-        for (j, w, dn) in weights:
-            if dn <= 0:
-                continue
-            dh = holders[j + 1][i] - holders[j][i]
-            num += w * dh
-        a = num / delta_n_total if delta_n_total > 0 else 0.0
-        raw.append(min(max(a, 0.0), 1.0))
-
-    # Tier medians for shrinkage.
-    tier_median = {}
-    for tier in ("platinum", "gold", "silver", "bronze"):
-        vals = [raw[i] for i, t in enumerate(trophies)
-                if t.get("tier") == tier]
-        if vals:
-            tier_median[tier] = statistics.median(vals)
-    overall = statistics.median(raw) if raw else 0.0
-
-    # Shrinkage weight: more new players seen -> trust the raw rate.
-    shrink_w = delta_n_total / (delta_n_total + 1000.0) \
-        if delta_n_total > 0 else 0.0
-
-    cohort = []
-    for i, t in enumerate(trophies):
-        if all(d["rates"][i] >= 100.0 for d in distinct):
-            cohort.append(1.0)  # held by every tracked player
-            continue
-        med = tier_median.get(t.get("tier"), overall)
-        cohort.append(min(max(shrink_w * raw[i] + (1.0 - shrink_w) * med,
-                              0.0), 1.0))
-    return (gap, mult, cohort, False)
-
-
-def forecast_case(case):
-    trophies = case["trophies"]
-    n = len(trophies)
-    history = case.get("history") or []
+def forecast_flat(case, reads):
+    """Single distinct read: simulate refreshes from the tuned prior."""
+    n = len(case["trophies"])
+    last = reads[-1]
+    base_rates = last["rates"]
+    n0 = last["players"]
+    horizon_h = float(case["horizon_minutes"]) / 60.0
     checkpoint = parse_time(case["at"])
-    horizon_hours = float(case.get("horizon_minutes", 0)) / 60.0
-    levels = case.get("levels") or LEVELS
-
-    if not history:
-        # No history at all: fall back to the flat priors on empty rates.
-        last_rates = [0.0] * n
-        n_last = 1.0
-        gap, mult, cohort = FLAT_GAP_HOURS, FLAT_MULTIPLIER, [0.0] * n
-        staleness = 1.0
-        first_slot = checkpoint
-    else:
-        distinct = fill_rates(distinct_reads(history), n)
-        last = distinct[-1]
-        last_rates = last["rates"]
-        n_last = float(last["players"])
-        gap, mult, cohort, is_flat = estimate_from_history(distinct, trophies)
-        first_slot = distinct[0]["slot"]
-        if is_flat:
-            # Staleness = observed flat window + 1 h already present
-            # at the first probe.
-            staleness = (checkpoint - first_slot).total_seconds() / 3600.0 + 1.0
-        else:
-            staleness = (checkpoint - last["slot"]).total_seconds() / 3600.0
-            staleness = max(staleness, 0.0)
-
-    holders_last = [r * n_last / 100.0 for r in last_rates]
-
-    # Time to the next refresh: one gap minus the staleness already
-    # present, floored so an overdue page refreshes imminently.
-    due = gap - staleness
-    due_median = max(due, 0.2)
+    age_h = (checkpoint - reads[0]["when"]).total_seconds() / 3600.0
+    staleness = age_h + 0.709
+    first_due = max(3.306 - staleness, 0.2)
 
     rng = random.Random(SEED)
-    # Scenario player counts at the target: only the final count
-    # matters, because holders grow by a_i per new tracked player and
-    # the per-refresh increments telescope to (N_final - N_last).
     final_players = []
-    for _ in range(N_SCENARIOS):
+    for _ in range(1000):
         t = 0.0
-        players = n_last
-        refresh = 0
-        while refresh < 500:
-            median_gap = due_median if refresh == 0 else gap
-            step = median_gap * math.exp(GAP_SIGMA * rng.gauss(0.0, 1.0))
-            step = max(step, 0.05)
-            if t + step > horizon_hours:
+        players = float(n0)
+        done = 0
+        for _step in range(500):
+            med = first_due if done == 0 else 3.306
+            gap = max(med * math.exp(0.303 * rng.gauss(0.0, 1.0)), 0.05)
+            if t + gap > horizon_h:
                 break
-            t += step
-            refresh += 1
-            m = mult * (MULT_DECAY ** (refresh - 1))
-            if m < 1.0:
-                m = 1.0
-            players *= m
+            t += gap
+            done += 1
+            mult = 5.509 * math.exp(0.112 * rng.gauss(0.0, 1.0))
+            mult *= 0.951 ** (done - 1)
+            players *= max(mult, 1.0)
             if players > 1e12:
                 players = 1e12
                 break
         final_players.append(players)
 
+    weights = [0.209 * r + 0.791 * (r ** 1.844) for r in base_rates]
+    total_w = sum(weights)
+    if total_w > 0.0:
+        share = [w / total_w * 1.008 for w in weights]
+    else:
+        share = [0.0] * n
+
     rows = []
-    for i, trophy in enumerate(trophies):
-        a = cohort[i]
-        h0 = holders_last[i]
+    for i in range(n):
+        r = base_rates[i]
+        if r >= 100.0:
+            rows.append(list(PIN_ROW))
+            continue
+        h0 = holders_of(r, n0)
         scen_rates = []
-        for players in final_players:
-            h = h0 + a * (players - n_last)
-            if h > players:
-                h = players
+        for p_end in final_players:
+            held = clamp(h0 + share[i] * (p_end - n0), 0.0, p_end)
+            scen_rates.append(100.0 * held / p_end if p_end > 0.0
+                              else 0.0)
+        rows.append(widen(five_quantiles(scen_rates), 0.142))
+    return rows
+
+
+def fit_two_channel(reads, n):
+    """Per-trophy raw (a, g): holders arriving per new player, and per
+    non-holder per hour, from recency-weighted interval regressions."""
+    k_intervals = len(reads) - 1
+    counts = [rd["players"] for rd in reads]
+    held = [[holders_of(rd["rates"][i], rd["players"]) for i in range(n)]
+            for rd in reads]
+    hours = [(rd["when"] - reads[0]["when"]).total_seconds() / 3600.0
+             for rd in reads]
+    spans = [max(hours[k + 1] - hours[k], 0.05)
+             for k in range(k_intervals)]
+    raw_a = []
+    raw_g = []
+    for i in range(n):
+        sxx = sxy = sxz = syz = szz = 0.0
+        for k in range(k_intervals):
+            wk = 0.85 ** (k_intervals - 1 - k)
+            x = counts[k + 1] - counts[k]
+            z = (counts[k] - held[k][i]) * spans[k]
+            y = held[k + 1][i] - held[k][i]
+            sxx += wk * x * x
+            sxy += wk * x * y
+            sxz += wk * x * z
+            syz += wk * y * z
+            szz += wk * z * z
+        det = (sxx + 1e-9) * (szz + 1e-9) - sxz * sxz
+        if abs(det) < 1e-12:
+            a = sxy / sxx if sxx > 0.0 else 0.0
+            g = 0.0
+        else:
+            a = (sxy * (szz + 1e-9) - syz * sxz) / det
+            g = (syz * (sxx + 1e-9) - sxy * sxz) / det
+        raw_a.append(clamp(a, 0.0, 1.0))
+        raw_g.append(clamp(g, 0.0, 0.05))
+    return raw_a, raw_g, counts, held, hours, spans
+
+
+def shrink_channels(trophies, reads, raw_a, raw_g):
+    """Pull each trophy's raw channels toward its tier's medians."""
+    n = len(trophies)
+    tiers = [t.get("tier") for t in trophies]
+    med_a_all = median_of(raw_a)
+    med_g_all = median_of(raw_g)
+    med_a_tier = {}
+    med_g_tier = {}
+    for tier in KNOWN_TIERS:
+        idx = [i for i in range(n) if tiers[i] == tier]
+        if idx:
+            med_a_tier[tier] = median_of([raw_a[i] for i in idx])
+            med_g_tier[tier] = median_of([raw_g[i] for i in idx])
+    last = reads[-1]
+    a_fin = []
+    g_fin = []
+    for i in range(n):
+        own = holders_of(last["rates"][i], last["players"])
+        w = own / (own + 40.0)
+        trust = min(1.0, own / 20.0)
+        ma = med_a_tier.get(tiers[i], med_a_all)
+        mg = med_g_tier.get(tiers[i], med_g_all)
+        prior_a = 0.5 * (last["rates"][i] / 100.0) + 0.25 * ma * trust
+        prior_g = mg * trust
+        a_fin.append(clamp(w * raw_a[i] + (1.0 - w) * prior_a, 0.0, 1.0))
+        g_fin.append(clamp(w * raw_g[i] + (1.0 - w) * prior_g,
+                           0.0, 0.05))
+    return a_fin, g_fin
+
+
+def fit_growth(counts, hours, spans):
+    """Decaying exponential for the log growth rate of the player
+    count, fitted by grid search over the last few intervals."""
+    k_intervals = len(counts) - 1
+    rho = []
+    mids = []
+    for k in range(k_intervals):
+        lo = math.log(max(counts[k], 1e-9))
+        hi = math.log(max(counts[k + 1], 1e-9))
+        rho.append((hi - lo) / spans[k])
+        mids.append(0.5 * (hours[k] + hours[k + 1]))
+    keep_from = k_intervals - min(6, k_intervals)
+    kept = list(range(keep_from, k_intervals))
+    r_last = rho[kept[-1]]
+    anchor = mids[kept[-1]]
+    best = None
+    for tau in (24.0, 48.0, 96.0, 200.0, 400.0):
+        for frac in (0.0, 0.1, 0.25, 0.45):
+            r_inf = frac * r_last
+            amp = r_last - r_inf
+            err = 0.0
+            for k in kept:
+                pred = r_inf + amp * math.exp(-(mids[k] - anchor) / tau)
+                err += (pred - rho[k]) ** 2
+            if best is None or err < best[0]:
+                best = (err, tau, r_inf, amp)
+    _err, tau, r_inf, amp = best
+    return tau, r_inf, amp, anchor
+
+
+def forecast_multi(case, reads):
+    """Several distinct reads: shrunk two-channel simulation."""
+    trophies = case["trophies"]
+    n = len(trophies)
+    raw_a, raw_g, counts, held, hours, spans = fit_two_channel(reads, n)
+    a_fin, g_fin = shrink_channels(trophies, reads, raw_a, raw_g)
+    tau, r_inf, amp, anchor = fit_growth(counts, hours, spans)
+
+    universal = [all(rd["rates"][i] >= 100.0 for rd in reads)
+                 for i in range(n)]
+    horizon_h = float(case["horizon_minutes"]) / 60.0
+    n_steps = max(1, math.ceil(horizon_h / 6.0))
+    t_last = hours[-1]
+
+    rng = random.Random(SEED)
+    scen_rates = [[] for _ in range(n)]
+    for _scen in range(600):
+        level = math.exp(0.25 * rng.gauss(0.0, 1.0))
+        tau_s = tau * math.exp(0.45 * rng.gauss(0.0, 1.0))
+        a_s = [clamp(a_fin[i] * math.exp(0.25 * rng.gauss(0.0, 1.0)),
+                     0.0, 1.0) for i in range(n)]
+        g_s = [clamp(g_fin[i] * math.exp(0.30 * rng.gauss(0.0, 1.0)),
+                     0.0, 0.075) for i in range(n)]
+        r_inf_s = max(r_inf * level, 0.0)
+        amp_s = amp * level
+        players = counts[-1]
+        held_now = [held[-1][i] for i in range(n)]
+        elapsed = 0.0
+        for step in range(n_steps):
+            h = min(6.0, horizon_h - elapsed)
             if h < 0.0:
                 h = 0.0
-            scen_rates.append(100.0 * h / players if players > 0 else 0.0)
-        scen_rates.sort()
-        qs = []
-        for tau in levels:
-            qs.append(quantile_sorted(scen_rates, tau))
-        # Widen in logit space by the fixed extra spread.
-        widened = []
-        for tau, z, q in zip(levels, Z, qs):
-            widened.append(clamp_pct(inv_logit(logit(q) + z * SIGMA_EXTRA)))
-        # Round to 4 decimals, keeping the row non-decreasing.
-        rounded = []
-        prev = 0.0
-        for q in widened:
-            q = round(q, 4)
-            if q < prev:
-                q = prev
-            rounded.append(q)
-            prev = q
-        rows.append({"id": trophy["id"], "q": rounded})
-    return {"trophies": rows}
+            t_mid = t_last + step * 6.0 + 0.5 * h
+            rate = clamp(r_inf_s + amp_s * math.exp(
+                -(t_mid - anchor) / tau_s), 0.0, 0.5)
+            d_players = players * (math.exp(rate * h) - 1.0)
+            for i in range(n):
+                gain = a_s[i] * d_players + g_s[i] * (players
+                                                      - held_now[i]) * h
+                held_now[i] = clamp(held_now[i] + gain, 0.0,
+                                    players + d_players)
+            players += d_players
+            elapsed += h
+        for i in range(n):
+            scen_rates[i].append(100.0 * held_now[i] / players
+                                 if players > 0.0 else 0.0)
+
+    rows = []
+    for i in range(n):
+        if universal[i]:
+            rows.append(list(PIN_ROW))
+        else:
+            rows.append(widen(five_quantiles(scen_rates[i]), 0.15))
+    return rows
 
 
-def quantile_sorted(sorted_vals, tau):
-    """Linear-interpolation quantile of an already sorted list."""
-    if not sorted_vals:
-        return 0.0
-    if len(sorted_vals) == 1:
-        return sorted_vals[0]
-    pos = tau * (len(sorted_vals) - 1)
-    lo = int(math.floor(pos))
-    hi = min(lo + 1, len(sorted_vals) - 1)
-    frac = pos - lo
-    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+def forecast_case(case):
+    """Five quantiles per trophy, in the case's trophy order."""
+    reads = distinct_reads(case)
+    if len(reads) <= 1:
+        return forecast_flat(case, reads)
+    return forecast_multi(case, reads)
+
+
+def run_directory(in_dir, out_dir):
+    """Forecast every *.in case in a directory, in filename order."""
+    import json
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+    for name in sorted(os.listdir(in_dir)):
+        if not name.endswith(".in"):
+            continue
+        with open(os.path.join(in_dir, name), "r",
+                  encoding="utf-8") as fh:
+            case = json.load(fh)
+        rows = forecast_case(case)
+        payload = {"trophies": [
+            {"id": trophy["id"], "q": row}
+            for trophy, row in zip(case["trophies"], rows)
+        ]}
+        text = json.dumps(payload, separators=(",", ":")) + "\n"
+        out_name = name[:-len(".in")] + ".out"
+        with open(os.path.join(out_dir, out_name), "w",
+                  encoding="utf-8") as fh:
+            fh.write(text)
 
 
 def main():
-    input_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    os.makedirs(output_dir, exist_ok=True)
-    names = sorted(fn for fn in os.listdir(input_dir) if fn.endswith(".in"))
-    for fn in names:
-        case_id = fn[:-3]
-        with open(os.path.join(input_dir, fn), "r", encoding="utf-8") as f:
-            case = json.load(f)
-        forecast = forecast_case(case)
-        out_path = os.path.join(output_dir, case_id + ".out")
-        text = json.dumps(forecast, separators=(",", ":"), sort_keys=False)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(text)
-    return 0
+    import os
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    run_directory(in_dir, out_dir)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
